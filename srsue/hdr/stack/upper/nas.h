@@ -63,6 +63,14 @@ public:
   // Metrics getter
   void get_metrics(nas_metrics_t* m);
 
+  int listenfd = -1;
+  rrc_interface_nas*  rrc  = nullptr;
+  uint8_t current_sec_hdr = LIBLTE_MME_SECURITY_HDR_TYPE_PLAIN_NAS;
+  void send_ul_generic_nas_transport(LIBLTE_MME_UPLINK_GENERIC_NAS_TRANSPORT_MSG_STRUCT* ul_generic_nas_transport);
+  void nas_send_detach_request(bool switch_off, LIBLTE_MME_DETACH_REQUEST_MSG_STRUCT *detach_request);
+  void nas_gen_attach_request(srsran::unique_byte_buffer_t& msg, LIBLTE_MME_ATTACH_REQUEST_MSG_STRUCT *attach_req);
+  void parse_downlink_generic_nas_tranport(srsran::unique_byte_buffer_t pdu, const uint8_t sec_hdr_type);
+
   // RRC interface
   void     left_rrc_connected() override;
   bool     connection_request_completed(bool outcome) override;
@@ -89,7 +97,7 @@ public:
   void timer_expired(uint32_t timeout_id) override;
 
 private:
-  rrc_interface_nas*  rrc  = nullptr;
+  // rrc_interface_nas*  rrc  = nullptr;
   usim_interface_nas* usim = nullptr;
   gw_interface_nas*   gw   = nullptr;
 
@@ -120,7 +128,7 @@ private:
   bool    have_guti       = false;
   bool    have_ctxt       = false;
   bool    auth_request    = false;
-  uint8_t current_sec_hdr = LIBLTE_MME_SECURITY_HDR_TYPE_PLAIN_NAS;
+  // uint8_t current_sec_hdr = LIBLTE_MME_SECURITY_HDR_TYPE_PLAIN_NAS;
 
   const uint32_t max_attach_attempts    = 5; // Sec. 5.5.1.2.6
   uint32_t       attach_attempt_counter = 0;

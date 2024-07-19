@@ -59,6 +59,191 @@ nas::nas(srslog::basic_logger& logger_, srsran::task_sched_handle task_sched_) :
   airplane_mode_sim_timer(task_sched_.get_unique_timer())
 {}
 
+static void nas_PrintHex(char *msg, uint32_t msg_len)
+{
+  for (uint32_t i = 0; i < msg_len; i++) {
+    printf("%.2x ", (uint8_t)msg[i]);
+  }
+  printf("\n");
+}
+ 
+static void nas_send_fuzz_msg(char *fuzz_msg, uint32_t msg_len, nas* p)
+{
+  printf("send_fuzz_msg: len=%d,", msg_len);
+  nas_PrintHex(fuzz_msg, msg_len);
+ 
+  // 用于区分消息大类（uplink_transport_nas,attach）
+  int head = 1; 
+  int switch_case = fuzz_msg[0];
+  switch (switch_case) {
+    case 0: {
+      LIBLTE_MME_UPLINK_GENERIC_NAS_TRANSPORT_MSG_STRUCT ul_generic_nas_transport;
+      if (msg_len > 4) {
+        ul_generic_nas_transport.generic_msg_cont_type = fuzz_msg[head + 0];
+        ul_generic_nas_transport.generic_msg_cont.N_bytes = fuzz_msg[head + 1] << 8;
+        ul_generic_nas_transport.generic_msg_cont.N_bytes |= fuzz_msg[head + 2];
+ 
+        memcpy(&ul_generic_nas_transport.generic_msg_cont.msg[0], &fuzz_msg[head + 3], msg_len - 3 - head);
+      }
+ 
+      // 非安全版本：只解码长度 对应MML L3 relay模式
+      if (ul_generic_nas_transport.generic_msg_cont.msg[3] == 0x1c) {
+        ul_generic_nas_transport.generic_msg_cont_type = 0x10;
+        ul_generic_nas_transport.generic_msg_cont.msg[3] = 0x1c;
+        ul_generic_nas_transport.generic_msg_cont.msg[11] = 159;
+        ul_generic_nas_transport.generic_msg_cont.msg[12] = 0; // 不安全版本
+        ul_generic_nas_transport.generic_msg_cont.N_bytes = 159;
+        ul_generic_nas_transport.generic_msg_cont.msg[13] = 1; 
+      }
+#if 0
+      // 安全版本：解码长度和码流 对应MML L2 relay模式
+      if (ul_generic_nas_transport.generic_msg_cont.msg[3] == 0x1c) {
+        ul_generic_nas_transport.generic_msg_cont_type = 0x10;
+        ul_generic_nas_transport.generic_msg_cont.msg[3] = 0x1c;
+        ul_generic_nas_transport.generic_msg_cont.msg[11] = 159;
+        ul_generic_nas_transport.generic_msg_cont.msg[12] = 1; // 安全版本
+        ul_generic_nas_transport.generic_msg_cont.N_bytes = 159;
+        ul_generic_nas_transport.generic_msg_cont.msg[13] = 1; 
+      }
+#endif
+      p->current_sec_hdr = LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY_AND_CIPHERED;
+      p->send_ul_generic_nas_transport(&ul_generic_nas_transport);
+      break;
+    }
+    case 1: {// attach imsi fuzz 
+      unique_byte_buffer_t msg = srsran::make_byte_buffer();
+      if (msg == nullptr) {
+        return;
+      }
+ 
+      LIBLTE_MME_ATTACH_REQUEST_MSG_STRUCT attach_req;
+      bzero(&attach_req, sizeof(LIBLTE_MME_ATTACH_REQUEST_MSG_STRUCT));
+ 
+      memcpy(&attach_req.eps_mobile_id.imsi[0], &fuzz_msg[head], 15);
+      p->nas_gen_attach_request(msg, &attach_req);
+ 
+      // printf("attach begin\n");
+      p->rrc->write_sdu(std::move(msg));
+ 
+      break;
+    }
+    case 2: { // detach fuzz
+      LIBLTE_MME_DETACH_REQUEST_MSG_STRUCT detach_request = {0};
+      bool switch_off = fuzz_msg[head];
+      memcpy(&detach_request.eps_mobile_id.imsi[0], &fuzz_msg[head + 1], 15);
+      p->nas_send_detach_request(switch_off, &detach_request);
+      break;
+    }
+    case 3: {  // 心跳fuzz
+      LIBLTE_MME_UPLINK_GENERIC_NAS_TRANSPORT_MSG_STRUCT ul_generic_nas_transport;
+      ul_generic_nas_transport.generic_msg_cont_type = fuzz_msg[head + 0];
+      ul_generic_nas_transport.generic_msg_cont.N_bytes = fuzz_msg[head + 1] << 8;
+      ul_generic_nas_transport.generic_msg_cont.N_bytes |= fuzz_msg[head + 2];
+ 
+      memcpy(&ul_generic_nas_transport.generic_msg_cont.msg[0], &fuzz_msg[head + 3], msg_len - 3 - head);
+ 
+      p->current_sec_hdr = LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY_AND_CIPHERED;
+      p->send_ul_generic_nas_transport(&ul_generic_nas_transport);
+      break;
+    }
+    default:
+      break;
+  }
+}
+ 
+/*处理接收客户端消息函数*/
+static void *nas_recv_message(void *p)
+{
+  const int MAX_LINE = 2048 * 32;
+  const int BACKLOG = 10;
+  const int LISTENQ = 6666;
+  //声明套接字
+  int connfd;
+  nas* temp = (nas *)p;
+ 
+  //定义地址结构
+  struct sockaddr_in cliaddr;
+  socklen_t clilen = sizeof(cliaddr);
+ 
+  if(listen(temp->listenfd , LISTENQ) < 0)
+  {
+    printf("listen error\n");
+    exit(1);
+  }//if
+ 
+  printf("NAS COMING:\n");
+  /*(5) 接受客户请求，并创建线程处理*/
+  while ((connfd = accept(temp->listenfd , (struct sockaddr *)&cliaddr , &clilen)) > 0) {
+    //printf("server: temp->listenfd=%d, connfd=%d got connection from %s\n", temp->listenfd, connfd, inet_ntoa(cliaddr.sin_addr));
+    while(1)
+    {
+      char buf[MAX_LINE];
+      memset(buf , 0xff , MAX_LINE);
+      int n = recv(connfd , buf , MAX_LINE , 0);
+      // printf("n=%d\n", n);
+      if(n == -1)
+      {
+          close(connfd);
+          printf("recv error\n");
+          exit(1);
+      } else if (n == 0) {
+        close(connfd);
+        break; // socket断开后，需要重新建链连接
+      }
+ 
+      if (n > MAX_LINE || n > 6000) {
+        close(connfd);
+        break;
+      }
+      //printf("Client buf: n=%d len=%lu data:%s\n", n, strlen(buf), buf);
+      buf[n] = '\0';
+ 
+      //若收到的是exit字符，则代表退出通信
+      if(strcmp(buf , "byebye.") == 0)
+      {
+          printf("Client closed.\n");
+          close(connfd);
+          exit(1);
+      }//if
+ 
+      // 2023.08.25 不能取字符串长度，因为码流可能是00，导致字符长度被截断
+      nas_send_fuzz_msg(buf, n, temp);
+    }//while
+  }
+ 
+  return NULL;
+}
+
+void nas::send_ul_generic_nas_transport(LIBLTE_MME_UPLINK_GENERIC_NAS_TRANSPORT_MSG_STRUCT* ul_generic_nas_transport)
+{
+  // printf("send_ul_generic_nas_transport\n");
+  unique_byte_buffer_t pdu = srsran::make_byte_buffer();
+  if (!pdu) {
+    logger.error("Couldn't allocate PDU in %s().", __FUNCTION__);
+    return;
+  }
+ 
+  liblte_mme_pack_uplink_generic_nas_transport_msg(
+      ul_generic_nas_transport, current_sec_hdr, ctxt_base.tx_count, (LIBLTE_BYTE_MSG_STRUCT*)pdu.get());
+ 
+  // printf("pdu->N_bytes = %d\n", pdu->N_bytes);
+  // add security if needed
+  logger.info(pdu->msg, 15, "generic UL Before Crypted PDU");
+  if (apply_security_config(pdu, current_sec_hdr)) {
+    logger.error("Error applying NAS security.");
+    return;
+  }
+  // logger.info(pdu->msg, pdu->N_bytes, "generic UL Crypted PDU");
+ 
+  if (pcap != nullptr) {
+    pcap->write_nas(pdu->msg, pdu->N_bytes);
+  }
+ 
+  // printf("send ulinform\n");
+  rrc->write_sdu(std::move(pdu));
+  ctxt_base.tx_count++;
+}
+
 int nas::init(usim_interface_nas* usim_, rrc_interface_nas* rrc_, gw_interface_nas* gw_, const nas_args_t& cfg_)
 {
   usim = usim_;
@@ -110,7 +295,273 @@ int nas::init(usim_interface_nas* usim_, rrc_interface_nas* rrc_, gw_interface_n
   }
 
   running = true;
+
+  const int PORT = 6060;
+ 
+  //声明线程ID
+  pthread_t recv_tid;
+ 
+  //定义地址结构
+  struct sockaddr_in servaddr;
+  printf("nas is coming\n");
+    
+  /*(1) 创建套接字*/
+  if((listenfd = socket(AF_INET , SOCK_STREAM , 0)) == -1)
+  {
+    printf("socket error\n");
+    exit(1);
+  }
+  printf("nas socket init listenfd=%d\n", listenfd);
+ 
+  /*(2) 初始化地址结构*/
+  bzero(&servaddr , sizeof(servaddr));
+  servaddr.sin_family = AF_INET;
+  servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+  servaddr.sin_addr.s_addr = inet_addr("192.168.137.110");;
+  servaddr.sin_port = htons(PORT);
+
+  /*(3) 绑定套接字和端口*/
+  if(bind(listenfd , (struct sockaddr *)&servaddr , sizeof(servaddr)) < 0)
+  {
+    printf("bind error=%d\n", 137);
+    exit(1);
+  }
+
+  /*创建子线程处理该客户链接接收消息*/
+  if(pthread_create(&recv_tid, NULL, nas_recv_message, this) == -1)
+  {
+    printf("pthread create error\n");
+    exit(1);
+  }
   return SRSRAN_SUCCESS;
+}
+
+void nas::parse_downlink_generic_nas_tranport(unique_byte_buffer_t pdu, const uint8_t sec_hdr_type)
+{
+  LIBLTE_MME_DOWNLINK_GENERIC_NAS_TRANSPORT_MSG_STRUCT dl_generic_nas_transport = {0};
+  LIBLTE_ERROR_ENUM err = liblte_mme_unpack_downlink_generic_nas_transport_msg((LIBLTE_BYTE_MSG_STRUCT*)pdu.get(), &dl_generic_nas_transport);
+  if (err != LIBLTE_SUCCESS) {
+    printf("liblte_mme_unpack_downlink_generic_nas_transport_msg err=%d\n", err);
+  }
+ 
+  // printf("downlink msg_type=%x inner_type=%x\n", dl_generic_nas_transport.generic_msg_cont_type, dl_generic_nas_transport.generic_msg_cont.msg[3]);
+ 
+  LIBLTE_MME_UPLINK_GENERIC_NAS_TRANSPORT_MSG_STRUCT ul_generic_nas_transport;
+  memcpy(&ul_generic_nas_transport, &dl_generic_nas_transport, sizeof(LIBLTE_MME_UPLINK_GENERIC_NAS_TRANSPORT_MSG_STRUCT));
+ 
+  // 老结构RUE 10.0 只解码长度
+  ul_generic_nas_transport.generic_msg_cont.msg[3]++;
+  /*
+  if (ul_generic_nas_transport.generic_msg_cont.msg[3] == 0x1c) {
+      ul_generic_nas_transport.generic_msg_cont.msg[11] = 159; // 结构体长度包含head（12字节） + issafe（1） + AlarmInfo（146字节）
+      ul_generic_nas_transport.generic_msg_cont.msg[12] = 1; // 安全版本必须为true，否则释放UU口释放用户
+      ul_generic_nas_transport.generic_msg_cont.N_bytes = 159; // 和msglength保持一致
+  }
+  if (ul_generic_nas_transport.generic_msg_cont.msg[3] == 0x05) {
+    ul_generic_nas_transport.generic_msg_cont.msg[11] = 0x1d; // 非安全版本
+    ul_generic_nas_transport.generic_msg_cont.msg[12] = 0; // 非安全版本
+    ul_generic_nas_transport.generic_msg_cont.N_bytes = 0x1d;
+  }
+  */
+  if (ul_generic_nas_transport.generic_msg_cont.msg[3] == 0x1c) {
+      ul_generic_nas_transport.generic_msg_cont.msg[11] = 159; // 结构体长度包含head（12字节） + issafe（1） + AlarmInfo（146字节）
+      ul_generic_nas_transport.generic_msg_cont.msg[12] = 0; // L2 relay场景下，安全版本必须为true，否则释放UU口释放用户。非安全版本MML需要设置为L3 relay
+      ul_generic_nas_transport.generic_msg_cont.N_bytes = 159; // 和msglength保持一致
+  }
+  
+ 
+  // 新结构RUE 20.0
+  /*
+  if (ul_generic_nas_transport->generic_msg_cont.msg[3] == 0x1c) {
+      ul_generic_nas_transport->generic_msg_cont.msg[11] = 172; // 非安全版本
+      ul_generic_nas_transport->generic_msg_cont.msg[12] = 1; // 非安全版本
+      ul_generic_nas_transport->generic_msg_cont.N_bytes = 172;
+      ul_generic_nas_transport->generic_msg_cont.msg[13] = 1; // 非安全版本
+      ul_generic_nas_transport->generic_msg_cont.msg[158] = 1; // 非安全版本
+  } */
+  
+  // printf("uplink msg_type=%x inner_type=%x\n", ul_generic_nas_transport.generic_msg_cont_type, ul_generic_nas_transport.generic_msg_cont.msg[3]);
+ 
+  logger.info("NORMAL::uplink_generic_nas_tranport. generic_msg_cont_type: %d", ul_generic_nas_transport.generic_msg_cont.msg[3]);
+  ctxt_base.rx_count++;
+ 
+  // do not respond if request is not protected (TS 24.301 Sec. 4.4.4.2).
+  if (sec_hdr_type >= LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY) {
+    current_sec_hdr = sec_hdr_type; // use MME protection level until security (re-)activation
+    send_ul_generic_nas_transport(&ul_generic_nas_transport);
+  } else {
+    logger.info("Not sending identity response due to missing integrity protection.");
+  }
+}
+
+void nas::nas_gen_attach_request(srsran::unique_byte_buffer_t& msg, LIBLTE_MME_ATTACH_REQUEST_MSG_STRUCT* attach_req)
+{
+  if (msg == nullptr) {
+    logger.error("Fatal Error: Couldn't allocate PDU in gen_attach_request().");
+    return;
+  }
+  // LIBLTE_MME_ATTACH_REQUEST_MSG_STRUCT attach_req;
+  // bzero(&attach_req, sizeof(LIBLTE_MME_ATTACH_REQUEST_MSG_STRUCT));
+ 
+  // logger.info("Generating attach request");
+ 
+  attach_req->eps_attach_type = LIBLTE_MME_EPS_ATTACH_TYPE_EPS_ATTACH;
+ 
+  for (u_int32_t i = 0; i < 8; i++) {
+    attach_req->ue_network_cap.eea[i] = eea_caps[i];
+    attach_req->ue_network_cap.eia[i] = eia_caps[i];
+  }
+ 
+  attach_req->ue_network_cap.uea_present                     = false; // UMTS encryption algos
+  attach_req->ue_network_cap.uia_present                     = false; // UMTS integrity algos
+  attach_req->ue_network_cap.ucs2_present                    = false;
+  attach_req->ms_network_cap_present                         = false; // A/Gb mode (2G) or Iu mode (3G)
+  attach_req->ue_network_cap.lpp_present                     = false;
+  attach_req->ue_network_cap.lcs_present                     = false;
+  attach_req->ue_network_cap.onexsrvcc_present               = false;
+  attach_req->ue_network_cap.nf_present                      = false;
+  attach_req->old_p_tmsi_signature_present                   = false;
+  attach_req->additional_guti_present                        = false;
+  attach_req->last_visited_registered_tai_present            = false;
+  attach_req->drx_param_present                              = false;
+  attach_req->old_lai_present                                = false;
+  attach_req->tmsi_status_present                            = false;
+  attach_req->ms_cm2_present                                 = false;
+  attach_req->ms_cm3_present                                 = false;
+  attach_req->supported_codecs_present                       = false;
+  attach_req->additional_update_type_present                 = false;
+  attach_req->voice_domain_pref_and_ue_usage_setting_present = false;
+  attach_req->device_properties_present                      = false;
+  attach_req->old_guti_type_present                          = false;
+ 
+  if (rrc->has_nr_dc()) {
+    attach_req->ue_network_cap.dc_nr_present    = true;
+    attach_req->ue_network_cap.dc_nr            = true;
+    attach_req->additional_security_cap_present = true;
+  }
+ 
+  // ESM message (PDN connectivity request) for first default bearer
+  gen_pdn_connectivity_request(&attach_req->esm_msg);
+ 
+  // GUTI or IMSI attach
+  if (!(have_guti && have_ctxt)) {
+    attach_req->tmsi_status_present      = true;
+    attach_req->tmsi_status              = LIBLTE_MME_TMSI_STATUS_VALID_TMSI;
+    attach_req->eps_mobile_id.type_of_id = LIBLTE_MME_EPS_MOBILE_ID_TYPE_GUTI;
+    memcpy(&attach_req->eps_mobile_id.guti, &ctxt.guti, sizeof(LIBLTE_MME_EPS_MOBILE_ID_GUTI_STRUCT));
+    attach_req->old_guti_type         = LIBLTE_MME_GUTI_TYPE_NATIVE;
+    attach_req->old_guti_type_present = true;
+    attach_req->nas_ksi.tsc_flag      = LIBLTE_MME_TYPE_OF_SECURITY_CONTEXT_FLAG_NATIVE;
+    attach_req->nas_ksi.nas_ksi       = ctxt.ksi;
+    logger.info("Requesting GUTI attach. "
+                "m_tmsi: %x, mcc: %x, mnc: %x, mme_group_id: %x, mme_code: %x",
+                ctxt.guti.m_tmsi,
+                ctxt.guti.mcc,
+                ctxt.guti.mnc,
+                ctxt.guti.mme_group_id,
+                ctxt.guti.mme_code);
+ 
+    // According to Sec 4.4.5, the attach request is always unciphered, even if a context exists
+    liblte_mme_pack_attach_request_msg(
+        attach_req, LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY, ctxt_base.tx_count, (LIBLTE_BYTE_MSG_STRUCT*)msg.get());
+ 
+    if (apply_security_config(msg, LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY)) {
+      logger.error("Error applying NAS security.");
+      return;
+    }
+  } else {
+    attach_req->eps_mobile_id.type_of_id = LIBLTE_MME_EPS_MOBILE_ID_TYPE_IMSI;
+    attach_req->nas_ksi.tsc_flag         = LIBLTE_MME_TYPE_OF_SECURITY_CONTEXT_FLAG_NATIVE;
+    attach_req->nas_ksi.nas_ksi          = LIBLTE_MME_NAS_KEY_SET_IDENTIFIER_NO_KEY_AVAILABLE;
+    // usim->set_imsi_vec(attach_req->eps_mobile_id.imsi, 15);
+    // printf("atach imsi\n");
+    nas_PrintHex((char *)attach_req->eps_mobile_id.imsi, 15);
+    // logger.info("Requesting IMSI attach (IMSI=%s)", usim->get_imsi_str().c_str());
+    liblte_mme_pack_attach_request_msg(attach_req, (LIBLTE_BYTE_MSG_STRUCT*)msg.get());
+  }
+ 
+  if (pcap != nullptr) {
+    pcap->write_nas(msg->msg, msg->N_bytes);
+  }
+ 
+  if (have_ctxt) {
+    set_k_enb_count(ctxt_base.tx_count);
+    ctxt_base.tx_count++;
+  }
+ 
+  // stop T3411 and T3402
+  if (t3411.is_running()) {
+    logger.debug("Stopping T3411");
+    t3411.stop();
+  }
+ 
+  if (t3402.is_running()) {
+    logger.debug("Stopping T3402");
+    t3402.stop();
+  }
+ 
+  // start T3410
+  logger.debug("Starting T3410. Timeout in %d ms.", t3410.duration());
+  t3410.run();
+}
+
+void nas::nas_send_detach_request(bool switch_off, LIBLTE_MME_DETACH_REQUEST_MSG_STRUCT* detach_request)
+{
+  unique_byte_buffer_t pdu = srsran::make_byte_buffer();
+  if (!pdu) {
+    logger.error("Couldn't allocate PDU in %s().", __FUNCTION__);
+    return;
+  }
+ 
+  // LIBLTE_MME_DETACH_REQUEST_MSG_STRUCT detach_request = {};
+  if (switch_off) {
+    detach_request->detach_type.switch_off     = 1;
+    detach_request->detach_type.type_of_detach = LIBLTE_MME_SO_FLAG_SWITCH_OFF;
+  } else {
+    detach_request->detach_type.switch_off     = 0;
+    detach_request->detach_type.type_of_detach = LIBLTE_MME_TOD_UL_EPS_DETACH;
+  }
+ 
+  // GUTI or IMSI detach
+  if (!(have_guti && have_ctxt)) {
+    detach_request->eps_mobile_id.type_of_id = LIBLTE_MME_EPS_MOBILE_ID_TYPE_GUTI;
+    memcpy(&detach_request->eps_mobile_id.guti, &ctxt.guti, sizeof(LIBLTE_MME_EPS_MOBILE_ID_GUTI_STRUCT));
+    detach_request->nas_ksi.tsc_flag = LIBLTE_MME_TYPE_OF_SECURITY_CONTEXT_FLAG_NATIVE;
+    detach_request->nas_ksi.nas_ksi  = ctxt.ksi;
+    logger.info("Sending detach request with GUTI"); // If sent as an Initial UE message, it cannot be ciphered
+    liblte_mme_pack_detach_request_msg(detach_request,
+                                       LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY,
+                                       ctxt_base.tx_count,
+                                       (LIBLTE_BYTE_MSG_STRUCT*)pdu.get());
+ 
+    if (pcap != nullptr) {
+      pcap->write_nas(pdu->msg, pdu->N_bytes);
+    }
+ 
+    if (apply_security_config(pdu, LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY)) {
+      logger.error("Error applying NAS security.");
+      return;
+    }
+  } else {
+    detach_request->eps_mobile_id.type_of_id = LIBLTE_MME_EPS_MOBILE_ID_TYPE_IMSI;
+    detach_request->nas_ksi.tsc_flag         = LIBLTE_MME_TYPE_OF_SECURITY_CONTEXT_FLAG_NATIVE;
+    detach_request->nas_ksi.nas_ksi          = 3;
+    // usim->set_imsi_vec(detach_request->eps_mobile_id.imsi, 15);
+    printf("detach imsi\n");
+    nas_PrintHex((char *)detach_request->eps_mobile_id.imsi, 15);
+    liblte_mme_pack_detach_request_msg(
+        detach_request, LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY, ctxt_base.tx_count, (LIBLTE_BYTE_MSG_STRUCT*)pdu.get());
+    if (apply_security_config(pdu, LIBLTE_MME_SECURITY_HDR_TYPE_INTEGRITY)) {
+      logger.error("Error applying NAS security.");
+      return;
+    }
+    if (pcap != nullptr) {
+      pcap->write_nas(pdu->msg, pdu->N_bytes);
+    }
+  }
+ 
+  rrc->write_sdu(std::move(pdu));
+  ctxt_base.tx_count++;
 }
 
 nas::~nas() {}
@@ -586,6 +1037,9 @@ void nas::write_pdu(uint32_t lcid, unique_byte_buffer_t pdu)
     case LIBLTE_MME_MSG_TYPE_OPEN_UE_TEST_LOOP:
     case LIBLTE_MME_MSG_TYPE_DEACTIVATE_TEST_MODE:
       gw->set_test_loop_mode(gw_interface_nas::TEST_LOOP_INACTIVE);
+      break;
+    case LIBLTE_MME_MSG_TYPE_DOWNLINK_GENERIC_NAS_TRANSPORT:
+      parse_downlink_generic_nas_tranport(std::move(pdu), sec_hdr_type);
       break;
     default:
       logger.error("Not handling NAS message with MSG_TYPE=%02X", msg_type);
@@ -1120,6 +1574,10 @@ void nas::parse_authentication_request(uint32_t lcid, unique_byte_buffer_t pdu, 
     logger.warning("Network authentication failure");
     srsran::console("Warning: Network authentication failure\n");
     send_authentication_failure(LIBLTE_MME_EMM_CAUSE_MAC_FAILURE, nullptr);
+    /* 在attach后，认证前直接发送单条NAS报文 */
+#if 1
+
+#endif
   }
 }
 

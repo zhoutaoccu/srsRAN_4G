@@ -47,6 +47,7 @@ using namespace srsran;
 using namespace asn1::rrc;
 using srsran::lte_srb;
 using srsran::srb_to_lcid;
+#define RRN_SWITCH 1
 
 namespace srsue {
 
@@ -886,6 +887,10 @@ void rrc::send_con_request(srsran::establishment_cause_t cause)
     rrc_conn_req->ue_id.random_value().from_number(random_id);
   }
   rrc_conn_req->establishment_cause = (establishment_cause_opts::options)cause;
+  if (RRN_SWITCH) {
+    /* RRN接入适配： high_prio_access高优先级用户 */
+    rrc_conn_req->establishment_cause = (establishment_cause_opts::options)1;
+  }
 
   send_ul_ccch_msg(ul_ccch_msg);
 }
@@ -1013,10 +1018,15 @@ void rrc::send_con_setup_complete(srsran::unique_byte_buffer_t nas_msg)
   ul_dcch_msg.msg.c1().rrc_conn_setup_complete().rrc_transaction_id = transaction_id;
 
   // Include rlf-InfoAvailable
-  if (var_rlf_report.has_info()) {
+  if (var_rlf_report.has_info() || RRN_SWITCH) {
     rrc_conn_setup_complete->non_crit_ext_present                                     = true;
     rrc_conn_setup_complete->non_crit_ext.non_crit_ext_present                        = true;
     rrc_conn_setup_complete->non_crit_ext.non_crit_ext.rlf_info_available_r10_present = true;
+
+    /* RRN接入适配： msg3携带可选字段sf_cfg_req，且填充not_require值 */
+    rrc_conn_setup_complete->non_crit_ext.non_crit_ext.rn_sf_cfg_req_r10_present = true;
+    rrc_conn_setup_complete->non_crit_ext.non_crit_ext.rn_sf_cfg_req_r10 = (rrc_conn_setup_complete_v1020_ies_s::rn_sf_cfg_req_r10_opts::options)1;
+    printf("set RRN_SWITCH = ON\n");
   }
 
   rrc_conn_setup_complete->sel_plmn_id = 1;
